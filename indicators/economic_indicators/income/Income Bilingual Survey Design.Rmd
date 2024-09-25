@@ -1,0 +1,289 @@
+---
+title: "Income Bilingual Survey Design"
+output: html_document
+date: "2024-07-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ipumsr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(survey)
+```
+
+## Loading in Data
+
+```{r echo=TRUE}
+#all crosswalks
+ddi <- read_ipums_ddi("usa_00009.xml")
+all_indicator_data <- read_ipums_micro(ddi)
+
+#location data
+regions <- read.csv("../location_data/County_12_Regions.csv")
+rural_urban <-read.csv("../location_data/rural_urban.csv")
+
+#language micro with bilungual 
+language_micro_data <- read.csv("Microdata_Bilingualism.csv")
+language_micro_data_full <- read.csv("Extensive_Microdata_Bilingualism.csv")
+```
+
+### Setting up Income Data
+
+```{r}
+income_data <- language_micro_data |>
+  select(AGE, INCTOT, Bilingual, PERWT, SEX, EDUCD, AGE, CLUSTER, STRATA, YEAR) |>
+  filter(INCTOT != 9999999 & INCTOT > 0) |>
+  filter(AGE > 18 & AGE < 65)
+
+sum_weights_filtered <- sum(income_data$PERWT, na.rm = TRUE)
+
+sum_weights_original <- sum(language_micro_data$PERWT, na.rm = TRUE)
+
+#recalibrate weights
+income_data <- income_data |>
+  mutate(recalibrated_weight = PERWT * (sum_weights_filtered / sum_weights_original))
+
+income_data_weighted <- income_data |>
+  mutate(Weighted_Income = INCTOT * (recalibrated_weight / 100))
+```
+
+```{r}
+write.csv(file = "Income_Bilingualism_Weighted_Data.csv", income_data_weighted)
+```
+
+### Using Survey Design
+
+Previously survey design not used, so using it properly now in this methodology.
+
+```{r}
+#setting it up
+options(survey.lonely.psu = "adjust")
+
+#creating the survey object
+des <- svydesign(ids = ~1, 
+                 strata = ~STRATA, 
+                 weights = ~PERWT, 
+                 data = income_data)
+
+#calculatng median by setting quantile to %50
+median_income <- svyby(~INCTOT, ~Bilingual, des, svyquantile, quantiles = 0.5, ci = TRUE)
+
+print(median_income)
+```
+
+```{r}
+#splitting into proper quintiles 
+income_data <- income_data |>
+  group_by(Bilingual)|>
+  mutate(quintile = ntile(INCTOT, 5)) |>
+  ungroup()
+
+#creating a survey design with modified income data
+des <- svydesign(ids = ~1, 
+                 strata = ~STRATA, 
+                 weights = ~PERWT, 
+                 data = income_data)
+
+#median for each quintile in income group
+median_by_quintile <- svyby(~INCTOT, ~interaction(Bilingual, quintile), des, svyquantile, quantiles = 0.5, ci = TRUE)
+
+print(median_by_quintile)
+```
+
+```{r}
+#changing the names of columns for clarity and separating interaction
+final_median_by_quintile <- median_by_quintile |> 
+  separate(`interaction(Bilingual, quintile)`, into = c("Bilingual", "Quintile"), sep = "\\.") |>
+  rename(median_income = INCTOT) 
+```
+
+#### Income Medians by Education
+
+CODES:
+
+| CODE      | Educational Level                       |
+|-----------|-----------------------------------------|
+| 001 & 999 | N/a & missing                           |
+| 002       | no schooling completed                  |
+| 10-61     | grade school                            |
+| 062       | high school or GED                      |
+| 65-100    | one or more years of college, no degree |
+| 101       | bachelors                               |
+| 114       | masters                                 |
+| 115       | professional degree beyond bachelors    |
+| 116       | doctoral                                |
+
+```{r}
+#clarity for the education codes
+map_educational_level <- function(code) {
+  if (code %in% c(1, 999)) {
+    return("N/A or Missing")
+  } else if (code == 2) {
+    return("No Schooling Completed")
+  } else if (code >= 10 & code < 62) {
+    return("No High School Degree or GED")
+  } else if (code >= 62 & code < 65) {
+    return("High School or GED")
+  } else if (code >= 65 & code <= 100) {
+    return("Some College, No Degree")
+  } else if (code == 101) {
+    return("Bachelor's")
+  } else if (code == 114) {
+    return("Master's")
+  } else if (code == 115) {
+    return("Professional Degree Beyond Bachelor's")
+  } else if (code == 116) {
+    return("Doctoral")
+  } else {
+    return(NA)
+  }
+}
+
+income_data_education <- income_data |> 
+  mutate(Educational_Level = sapply(EDUCD, map_educational_level))
+
+
+income_data_education |>
+  filter(is.na(Educational_Level))
+```
+
+```{r}
+#creating survey design for education dataset
+des_edu <- svydesign(ids = ~CLUSTER, 
+                     strata = ~STRATA, 
+                     weights = ~PERWT, 
+                     data = income_data_education)
+
+#calculating the median income for each education level within each bilingual group
+median_by_education <- svyby(~INCTOT, ~interaction(Bilingual, Educational_Level), des_edu, svyquantile, quantiles = 0.5, ci = TRUE)
+
+#for clarity
+median_by_education <- median_by_education |>
+  separate(`interaction(Bilingual, Educational_Level)`, into = c("Bilingual", "Educational_Level"), sep = "\\.")|>
+  rename(median_income = INCTOT) |>
+  rename(se_median_income = se.INCTOT) |>
+  select(Bilingual, Educational_Level, median_income, se_median_income)
+
+print(median_by_education)
+```
+
+EXTENSIVE BILINGUAL
+
+```{r}
+income_data_full <- language_micro_data_full |>
+  select(AGE, INCTOT, Language_Group, PERWT, SEX, EDUCD, AGE, CLUSTER, STRATA, YEAR, Bilingual_Status) |>
+  filter(INCTOT != 9999999 & INCTOT > 0) |>
+  filter(AGE > 18 & AGE < 65) |>
+  filter(Bilingual_Status %in% c("English Monolingual", "Bilingual"))
+
+#applying the educational level mapping function
+income_data_full <- income_data_full |>
+  mutate(Educational_Level = sapply(EDUCD, map_educational_level))
+```
+
+```{r}
+#survey design object
+des_full <- svydesign(ids = ~1, 
+                      strata = ~STRATA, 
+                      weights = ~PERWT, 
+                      data = income_data_full)
+
+#calculating the median income for each education level within each language group
+median_by_education_full <- svyby(~INCTOT, ~interaction(Language_Group, Educational_Level), des_full, svyquantile, quantiles = 0.5, ci = TRUE)
+
+#formatting the results for clarity
+median_by_education_full <- median_by_education_full |>
+  separate(`interaction(Language_Group, Educational_Level)`, into = c("Language_Group", "Educational_Level"), sep = "\\.") |>
+  rename(median_income = INCTOT) |>
+  rename(se_median_income = se.INCTOT) |>
+  select(Language_Group, Educational_Level, median_income, se_median_income)
+
+print(median_by_education_full)
+```
+
+```{r}
+#pivoting the data wider to have one row per Educational_Level
+income_data_wide <- median_by_education_full |>
+  pivot_wider(names_from = Language_Group, 
+              values_from = c(median_income, se_median_income))
+
+print(income_data_wide)
+```
+
+Bilingual and Non-English Monolingual
+
+```{r}
+# Filtering and setting up the data
+income_data_full_NE <- language_micro_data_full |>
+  select(AGE, INCTOT, Language_Group, Bilingual_Status, PERWT, SEX, EDUCD, CLUSTER, STRATA, YEAR) |>
+  filter(INCTOT != 9999999 & INCTOT > 0) |>
+  filter(AGE > 18 & AGE < 65) |>
+  filter(Bilingual_Status %in% c("Bilingual", "NE Monolingual"))
+
+# Recalibrating weights
+sum_weights_filtered_full_NE <- sum(income_data_full_NE$PERWT, na.rm = TRUE)
+sum_weights_original_full_NE <- sum(language_micro_data_full$PERWT, na.rm = TRUE)
+
+income_data_full <- income_data_full_NE |>
+  mutate(recalibrated_weight = PERWT * (sum_weights_filtered_full_NE / sum_weights_original_full_NE))
+
+income_data_full_NE <- income_data_full_NE |>
+  mutate(Educational_Level = sapply(EDUCD, map_educational_level))
+
+income_data_full_NE <- income_data_full_NE |>
+  filter(!is.na(INCTOT), !is.na(PERWT), !is.na(EDUCD))
+
+table(income_data_full_NE$Educational_Level)
+```
+
+```{r}
+# Creating the survey design object
+des_full_NE <- svydesign(ids = ~1, 
+                      strata = ~STRATA, 
+                      weights = ~PERWT, 
+                      data = income_data_full_NE)
+
+# Calculating the median income by education level for each language group and bilingual status
+median_by_education_full_NE <- svyby(~INCTOT, 
+                                  ~interaction(Language_Group, Educational_Level, Bilingual_Status), 
+                                  des_full_NE, 
+                                  svyquantile, 
+                                  quantiles = 0.5, 
+                                  ci = TRUE)
+
+# Formatting the results for clarity
+median_by_education_full_NE <- median_by_education_full_NE |>
+  separate(`interaction(Language_Group, Educational_Level, Bilingual_Status)`, 
+           into = c("Language_Group", "Educational_Level", "Bilingual_Status"), sep = "\\.") |>
+  rename(median_income = INCTOT) |>
+  rename(se_median_income = se.INCTOT) |>
+  select(Language_Group, Educational_Level, Bilingual_Status, median_income, se_median_income)
+
+print(median_by_education_full_NE)
+```
+
+```{r}
+income_data_wide_NE <- median_by_education_full_NE |>
+  pivot_wider(names_from = Language_Group, 
+              values_from = c(median_income, se_median_income))
+
+print(income_data_wide_NE)
+```
+
+CSV FILES
+
+```{r}
+write.csv(file = "Income_SD_Median_Income.csv", median_income)
+write.csv(file = "Income_SD_Quintile_Medians.csv", final_median_by_quintile)
+write.csv(file = "Income_SD_ByEducation_Medians.csv", median_by_education)
+```
+
+```{r}
+write.csv(file = "Income_SD_ByEducation_ByLanguage_Medians.csv", income_data_wide)
+```
+
+```{r}
+write.csv(file = "Income_SD_ByEducation_Bilingual_Monolingual_Medians.csv", income_data_wide_NE)
+```
